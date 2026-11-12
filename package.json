@@ -1,0 +1,10 @@
+{
+  "name": "lojistik-saas",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "sunucu": "cd sunucu && npm run dev",
+    "frontend": "cd frontend && npm run dev"
+  }
+}
+
