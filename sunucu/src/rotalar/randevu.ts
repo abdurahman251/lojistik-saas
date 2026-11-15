@@ -3,8 +3,12 @@ import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import { sorgu } from '../veritabani';
+import { kimlikDogrula } from '../middleware/auth';
 
 export const randevuRouter = Router();
+
+// Randevu işlemlerinde oturum doğrulaması zorunludur
+randevuRouter.use(kimlikDogrula);
 
 // Evrak yükleme için Multer yapılandırması
 const yuklemeDizini = path.join(__dirname, '../../uploads/evraklar');
@@ -64,8 +68,8 @@ randevuRouter.get('/aktif', async (req: Request, res: Response): Promise<void> =
   }
 });
 
-// POST /api/randevu/olustur - Yeni Randevu Al
-randevuRouter.post('/olustur', yukle.single('evrak'), async (req: Request, res: Response): Promise<void> => {
+// POST /api/randevu/olustur - Yeni Randevu Al (Temiz, evraksız hızlı kayıt)
+randevuRouter.post('/olustur', async (req: Request, res: Response): Promise<void> => {
   try {
     const {
       tirId,
@@ -114,16 +118,17 @@ randevuRouter.post('/olustur', yukle.single('evrak'), async (req: Request, res: 
       return;
     }
 
-    // 3. Dosya yolu kontrolü
-    const evrakYolu = req.file ? `/uploads/evraklar/${req.file.filename}` : (req.body.evrakYolu || null);
+    // 3. Benzersiz İnsansız Kapı QR Kodu Üret (Örn: QR-34IST01-8F3A2)
+    const benzersizEk = Math.random().toString(36).substring(2, 7).toUpperCase();
+    const qrKod = `QR-${temizPlaka.replace(/\s+/g, '')}-${benzersizEk}`;
 
-    // 4. Veritabanına kaydet
+    // 4. Veritabanına kaydet (İrsaliye sahada operatör tarafından doldurulup sürücü tarafından e-imzalanacak)
     const yeniRandevuRes = await sorgu(
       `INSERT INTO randevular (
         tir_id, plaka, kalkis_sehri, varis_sehri, 
         randevu_tarihi, randevu_saati, sofor_ad_soyad, 
-        sofor_telefon, evrak_yolu, durum
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'BEKLEMEDE')
+        sofor_telefon, evrak_durumu, qr_kod, durum, irsaliye_durumu
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'GEREKLI_DEGIL', $9, 'BEKLEMEDE', 'YOK')
       RETURNING *`,
       [
         tirId || null,
@@ -134,7 +139,7 @@ randevuRouter.post('/olustur', yukle.single('evrak'), async (req: Request, res: 
         randevuSaati,
         soforAdSoyad,
         soforTelefon,
-        evrakYolu,
+        qrKod,
       ]
     );
 
@@ -142,7 +147,7 @@ randevuRouter.post('/olustur', yukle.single('evrak'), async (req: Request, res: 
 
     res.status(201).json({
       basarili: true,
-      mesaj: 'Randevunuz başarıyla oluşturuldu.',
+      mesaj: 'Randevunuz başarıyla oluşturuldu. Kapıda QR kodunuzu okutarak içeri girebilirsiniz.',
       randevu: yeniRandevu,
     });
   } catch (error: any) {
@@ -154,6 +159,66 @@ randevuRouter.post('/olustur', yukle.single('evrak'), async (req: Request, res: 
   }
 });
 
+// POST /api/randevu/irsaliye-imzala/:id - Sürücünün Resmi Sevk İrsaliyesini e-İmza ile Onaylaması
+randevuRouter.post('/irsaliye-imzala/:id', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const { imza } = req.body;
+
+    if (!imza) {
+      res.status(400).json({ basarili: false, mesaj: 'Dijital imza verisi gereklidir.' });
+      return;
+    }
+
+    // Randevuyu kontrol et
+    const randevuRes = await sorgu('SELECT * FROM randevular WHERE id = $1', [id]);
+    if (randevuRes.rows.length === 0) {
+      res.status(404).json({ basarili: false, mesaj: 'Randevu bulunamadı.' });
+      return;
+    }
+
+    const randevu = randevuRes.rows[0];
+
+    // İmzayı veritabanına kaydet ve tırı YOLDA durumuna geçir
+    const guncelRes = await sorgu(
+      `UPDATE randevular 
+       SET sofor_imzasi = $1, 
+           irsaliye_durumu = 'IMZALANDI', 
+           durum = 'YOLDA', 
+           cikis_zamani = NOW(), 
+           cagri_durumu = 'SEVK_EDILDI'
+       WHERE id = $2
+       RETURNING *`,
+      [imza, id]
+    );
+
+    const guncelRandevu = guncelRes.rows[0];
+
+    // Sürücüye bildirim oluştur
+    await sorgu(
+      `INSERT INTO bildirimler (
+        randevu_id, tir_id, plaka, baslik, mesaj, tip, operasyon_tipi
+      ) VALUES ($1, $2, $3, $4, $5, 'SEVK_EDILDI', 'YUKLEME')`,
+      [
+        id,
+        randevu.tir_id,
+        randevu.plaka,
+        `✓ İrsaliye Onaylandı • ${randevu.varis_sehri} İstikametine Yoldasınız`,
+        `Sayın ${randevu.sofor_ad_soyad}, ${randevu.irsaliye_no || 'Resmi'} numaralı sevk irsaliyeniz e-imzanız ile başarıyla onaylandı. ${randevu.varis_sehri} varış terminali Kiosk'unda bu irsaliyenin karekodunu okutunuz. İyi yolculuklar!`,
+      ]
+    );
+
+    res.json({
+      basarili: true,
+      mesaj: 'Sevk irsaliyesi başarıyla imzalandı ve yola çıkışınız onaylandı.',
+      randevu: guncelRandevu,
+    });
+  } catch (error: any) {
+    console.error('İrsaliye İmza Hatası:', error);
+    res.status(500).json({ basarili: false, mesaj: 'İrsaliye imzalama işlemi başarısız oldu.' });
+  }
+});
+
 // POST /api/randevu/iptal/:id - Randevuyu İptal Et (Test kolaylığı için)
 randevuRouter.post('/iptal/:id', async (req: Request, res: Response): Promise<void> => {
   try {
@@ -162,6 +227,75 @@ randevuRouter.post('/iptal/:id', async (req: Request, res: Response): Promise<vo
     res.json({ basarili: true, mesaj: 'Randevu iptal edildi.' });
   } catch (error: any) {
     res.status(500).json({ basarili: false, mesaj: 'Randevu iptal edilemedi.' });
+  }
+});
+
+// GET /api/randevu/bildirimler - Sürücünün Çağrı ve Mesaj Bildirimleri
+randevuRouter.get('/bildirimler', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { tirId, plaka } = req.query;
+
+    if (!tirId && !plaka) {
+      res.status(400).json({ basarili: false, mesaj: 'tirId veya plaka gereklidir.' });
+      return;
+    }
+
+    const temizPlaka = plaka ? plaka.toString().trim() : '';
+
+    const sonuc = await sorgu(
+      `SELECT * FROM bildirimler 
+       WHERE (tir_id = $1 OR LOWER(REPLACE(plaka, ' ', '')) = LOWER(REPLACE($2, ' ', '')))
+       ORDER BY olusturulma_tarihi DESC 
+       LIMIT 30`,
+      [tirId || null, temizPlaka]
+    );
+
+    const okunmamisSayisi = sonuc.rows.filter((b) => !b.okundu).length;
+
+    res.json({
+      basarili: true,
+      bildirimler: sonuc.rows,
+      okunmamisSayisi,
+    });
+  } catch (error: any) {
+    console.error('Bildirim Sorgu Hatası:', error);
+    res.status(500).json({ basarili: false, mesaj: 'Bildirimler alınamadı.' });
+  }
+});
+
+// POST /api/randevu/bildirim-okundu/:id - Bildirimi Okundu Yap
+randevuRouter.post('/bildirim-okundu/:id', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    await sorgu(`UPDATE bildirimler SET okundu = TRUE WHERE id = $1`, [id]);
+    res.json({ basarili: true });
+  } catch (err: any) {
+    res.status(500).json({ basarili: false, mesaj: 'Bildirim güncellenemedi.' });
+  }
+});
+
+// POST /api/randevu/rampa-yanas/:id - Sürücü "Rampaya Yanaşıyorum" Çağrı Teyidi
+randevuRouter.post('/rampa-yanas/:id', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const guncel = await sorgu(
+      `UPDATE randevular SET cagri_durumu = 'YANASTI' WHERE id = $1 RETURNING *`,
+      [id]
+    );
+
+    if (guncel.rows.length === 0) {
+      res.status(404).json({ basarili: false, mesaj: 'Randevu bulunamadı.' });
+      return;
+    }
+
+    res.json({
+      basarili: true,
+      mesaj: 'Rampaya yanaşma teyidiniz operatöre iletildi. İyi çalışmalar!',
+      randevu: guncel.rows[0],
+    });
+  } catch (err: any) {
+    console.error('Rampaya yanaşma hatası:', err);
+    res.status(500).json({ basarili: false, mesaj: 'Rampaya yanaşma teyidi kaydedilemedi.' });
   }
 });
 

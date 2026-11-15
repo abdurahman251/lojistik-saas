@@ -2,13 +2,18 @@ import { Router, Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { sorgu } from '../veritabani';
+import { 
+  girisRateLimiter, 
+  hataliGirisKaydet, 
+  basariliGirisSifirla 
+} from '../middleware/rate-limiter';
 
 export const authRouter = Router();
 
 const JWT_SECRET = process.env.JWT_SECRET || 'lojistik_os_super_gizli_anahtar_2026';
 
-// /api/auth/login - Plaka veya Kullanıcı Adı ile hibrit giriş
-authRouter.post('/login', async (req: Request, res: Response): Promise<void> => {
+// /api/auth/login - Plaka veya Kullanıcı Adı ile hibrit giriş (Rate-Limiter Korumalı)
+authRouter.post('/login', girisRateLimiter, async (req: Request, res: Response): Promise<void> => {
   try {
     const { girisDegeri, sifre } = req.body;
 
@@ -32,10 +37,11 @@ authRouter.post('/login', async (req: Request, res: Response): Promise<void> => 
     );
 
     if (sonuc.rows.length === 0) {
-      res.status(401).json({
-        basarili: false,
-        mesaj: 'Kullanıcı adı / Plaka veya şifre hatalı.',
-      });
+      const { kilitlendi, kalanHak } = hataliGirisKaydet(req);
+      const mesaj = kilitlendi
+        ? '5 kez hatalı giriş yapıldı. Güvenliğiniz için hesabınız 15 dakika kilitlendi.'
+        : `Kullanıcı adı / Plaka veya şifre hatalı. (Kalan deneme hakkı: ${kalanHak})`;
+      res.status(401).json({ basarili: false, mesaj });
       return;
     }
 
@@ -43,12 +49,36 @@ authRouter.post('/login', async (req: Request, res: Response): Promise<void> => 
 
     const sifreDogruMu = await bcrypt.compare(sifre, kullanici.sifre);
     if (!sifreDogruMu) {
-      res.status(401).json({
-        basarili: false,
-        mesaj: 'Kullanıcı adı / Plaka veya şifre hatalı.',
-      });
+      const { kilitlendi, kalanHak } = hataliGirisKaydet(req);
+      const mesaj = kilitlendi
+        ? '5 kez hatalı giriş yapıldı. Güvenliğiniz için hesabınız 15 dakika kilitlendi.'
+        : `Kullanıcı adı / Plaka veya şifre hatalı. (Kalan deneme hakkı: ${kalanHak})`;
+      res.status(401).json({ basarili: false, mesaj });
       return;
     }
+
+    // 1. Yönetici Onay Durumu Kontrolü (Sürücüler için)
+    if (kullanici.rol === 'SURUCU') {
+      if (kullanici.onay_durumu === 'BEKLEMEDE') {
+        res.status(403).json({
+          basarili: false,
+          onayBekliyor: true,
+          mesaj: 'Tır ve sürücü kaydınız henüz yönetici onayı beklemektedir. Yönetici onayının ardından sisteme giriş yapabilirsiniz.',
+        });
+        return;
+      }
+
+      if (kullanici.onay_durumu === 'REDDEDILDI') {
+        res.status(403).json({
+          basarili: false,
+          mesaj: 'Tır kayıt başvurunuz filo yöneticisi tarafından onaylanmamıştır. Lütfen yönetim ile iletişime geçin.',
+        });
+        return;
+      }
+    }
+
+    // Giriş başarılı: Hatalı deneme sayacını sıfırla
+    basariliGirisSifirla(req);
 
     const token = jwt.sign(
       {
@@ -138,39 +168,27 @@ authRouter.post('/kayit', async (req: Request, res: Response): Promise<void> => 
     // Şifreyi hashle
     const sifreHash = await bcrypt.hash(sifre, 10);
 
-    // Veritabanına yeni Tır sürücüsü ekle
+    // Veritabanına yeni Tır sürücüsü ekle (Güvenlik için Yönetici Onayı Beklemede)
     const yeniKullaniciRes = await sorgu(
-      `INSERT INTO kullanicilar (kullanici_adi, sifre, rol, sehir, plaka)
-       VALUES ($1, $2, 'SURUCU', $3, $4)
-       RETURNING id, kullanici_adi, rol, sehir, plaka, olusturulma_tarihi`,
+      `INSERT INTO kullanicilar (kullanici_adi, sifre, rol, sehir, plaka, onay_durumu)
+       VALUES ($1, $2, 'SURUCU', $3, $4, 'BEKLEMEDE')
+       RETURNING id, kullanici_adi, rol, sehir, plaka, onay_durumu, olusturulma_tarihi`,
       [temizKullaniciAdi, sifreHash, secilenSehir, temizPlaka]
     );
 
     const yeniKullanici = yeniKullaniciRes.rows[0];
 
-    // Oturum Token'ı üret
-    const token = jwt.sign(
-      {
-        id: yeniKullanici.id,
-        kullaniciAdi: yeniKullanici.kullanici_adi,
-        rol: yeniKullanici.rol,
-        sehir: yeniKullanici.sehir,
-        plaka: yeniKullanici.plaka,
-      },
-      JWT_SECRET,
-      { expiresIn: '24h' }
-    );
-
     res.status(201).json({
       basarili: true,
-      mesaj: 'Tır kaydı başarıyla oluşturuldu.',
-      token,
+      onayBekliyor: true,
+      mesaj: `✓ ${temizPlaka} plakalı tır kaydınız başarıyla alındı! Güvenlik doğrulaması gereği başvurunuz filo yöneticisi onayına iletildi. Onaylandıktan sonra giriş yapabilirsiniz.`,
       kullanici: {
         id: yeniKullanici.id,
         kullaniciAdi: yeniKullanici.kullanici_adi,
         rol: yeniKullanici.rol,
         sehir: yeniKullanici.sehir,
         plaka: yeniKullanici.plaka,
+        onayDurumu: yeniKullanici.onay_durumu,
       },
     });
   } catch (error: any) {

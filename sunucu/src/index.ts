@@ -6,6 +6,7 @@ import { authRouter } from './rotalar/auth';
 import { randevuRouter } from './rotalar/randevu';
 import { kioskRouter } from './rotalar/kiosk';
 import { operatorRouter } from './rotalar/operator';
+import { adminRouter } from './rotalar/admin';
 import { sorgu } from './veritabani';
 
 dotenv.config();
@@ -33,6 +34,7 @@ app.use('/api/auth', authRouter);
 app.use('/api/randevu', randevuRouter);
 app.use('/api/kiosk', kioskRouter);
 app.use('/api/operator', operatorRouter);
+app.use('/api/admin', adminRouter);
 
 app.listen(PORT, () => {
   console.log(`Lojistik OS Sunucusu ${PORT} portunda çalışıyor.`);

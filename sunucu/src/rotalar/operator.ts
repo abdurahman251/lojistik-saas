@@ -1,7 +1,12 @@
 import { Router, Request, Response } from 'express';
 import { sorgu } from '../veritabani';
+import { kimlikDogrula, rolKontrol } from '../middleware/auth';
 
 export const operatorRouter = Router();
+
+// Güvenlik Kalkanı: Sadece OPERATOR ve YONETICI yetkisine sahip kullanıcılar erişebilir
+operatorRouter.use(kimlikDogrula);
+operatorRouter.use(rolKontrol('OPERATOR', 'YONETICI'));
 
 // GET /api/operator/durum?sehir=ISTANBUL
 operatorRouter.get('/durum', async (req: Request, res: Response): Promise<void> => {
@@ -15,41 +20,48 @@ operatorRouter.get('/durum', async (req: Request, res: Response): Promise<void> 
 
     const temizSehir = sehir.toString().trim().toUpperCase();
 
-    // 1. Bu şehre ait 8 Rampa ve atanmış tır bilgileri
-    const rampalarRes = await sorgu(
-      `SELECT r.id, r.ad, r.numara, r.sehir, r.durum, r.su_anki_randevu_id, 
-              r.operasyon_tipi, r.islem_baslangic,
-              rnd.plaka, rnd.sofor_ad_soyad, rnd.sofor_telefon, rnd.kalkis_sehri, rnd.varis_sehri
-       FROM rampalar r
-       LEFT JOIN randevular rnd ON r.su_anki_randevu_id = rnd.id
-       WHERE r.sehir = $1
-       ORDER BY r.numara ASC`,
-      [temizSehir]
-    );
-
-    // 2. Sahada Bekleyen Tırlar (Kiosk onayı almış, rampa ataması bekleyen araçlar)
-    const sahadaRes = await sorgu(
-      `SELECT id, tir_id, plaka, kalkis_sehri, varis_sehri, 
-              randevu_tarihi, randevu_saati, sofor_ad_soyad, sofor_telefon, 
-              durum, kiosk_giris_saati, is_gecikme
-       FROM randevular 
-       WHERE (varis_sehri = $1 OR kalkis_sehri = $1)
-         AND durum = 'SAHADA'
-       ORDER BY kiosk_giris_saati ASC NULLS LAST, olusturulma_tarihi ASC`,
-      [temizSehir]
-    );
-
-    // 3. Yoldaki Araçlar (Diğer şehirlerden bu şehre doğru seyahat eden kargolar)
-    const yoldaRes = await sorgu(
-      `SELECT id, tir_id, plaka, kalkis_sehri, varis_sehri, 
-              randevu_tarihi, randevu_saati, sofor_ad_soyad, sofor_telefon, 
-              durum, cikis_zamani, is_gecikme
-       FROM randevular 
-       WHERE varis_sehri = $1 
-         AND durum = 'YOLDA'
-       ORDER BY cikis_zamani ASC NULLS LAST`,
-      [temizSehir]
-    );
+    // 1-4. Tüm verileri paralel olarak çek (Sıralı bekleyerek gecikme yaşanmasın)
+    const [rampalarRes, sahadaRes, yoldaRes, ihlallerRes] = await Promise.all([
+      // 1. Rampalar
+      sorgu(
+        `SELECT r.id, r.ad, r.numara, r.sehir, r.durum, r.su_anki_randevu_id, 
+                r.operasyon_tipi, r.islem_baslangic,
+                rnd.plaka, rnd.sofor_ad_soyad, rnd.sofor_telefon, rnd.kalkis_sehri, rnd.varis_sehri
+         FROM rampalar r
+         LEFT JOIN randevular rnd ON r.su_anki_randevu_id = rnd.id
+         WHERE r.sehir = $1
+         ORDER BY r.numara ASC`,
+        [temizSehir]
+      ),
+      // 2. Sahada Bekleyen Tırlar
+      sorgu(
+        `SELECT id, tir_id, plaka, kalkis_sehri, varis_sehri, 
+                randevu_tarihi, randevu_saati, sofor_ad_soyad, sofor_telefon, 
+                durum, kiosk_giris_saati, is_gecikme
+         FROM randevular 
+         WHERE (varis_sehri = $1 OR kalkis_sehri = $1)
+           AND durum = 'SAHADA'
+         ORDER BY kiosk_giris_saati ASC NULLS LAST, olusturulma_tarihi ASC`,
+        [temizSehir]
+      ),
+      // 3. Yoldaki Araçlar
+      sorgu(
+        `SELECT id, tir_id, plaka, kalkis_sehri, varis_sehri, 
+                randevu_tarihi, randevu_saati, sofor_ad_soyad, sofor_telefon, 
+                durum, cikis_zamani, is_gecikme
+         FROM randevular 
+         WHERE varis_sehri = $1 
+           AND durum = 'YOLDA'
+         ORDER BY cikis_zamani ASC NULLS LAST`,
+        [temizSehir]
+      ),
+      // 4. İhlal Kayıtları
+      sorgu(
+        `SELECT * FROM ihlal_kayitlari 
+         ORDER BY tarih DESC 
+         LIMIT 15`
+      )
+    ]);
 
     const doluRampaSayisi = rampalarRes.rows.filter((r) => r.durum === 'DOLU').length;
     const musaitRampaSayisi = 8 - doluRampaSayisi;
@@ -64,10 +76,12 @@ operatorRouter.get('/durum', async (req: Request, res: Response): Promise<void> 
         musaitRampaSayisi,
         yoldaSayisi: yoldaRes.rows.length,
         dolulukYuzdesi,
+        ihlalSayisi: ihlallerRes.rows.length,
       },
       rampalar: rampalarRes.rows,
       sahadakiTirlar: sahadaRes.rows,
       yoldakiTirlar: yoldaRes.rows,
+      ihlaller: ihlallerRes.rows,
     });
   } catch (error: any) {
     console.error('Operatör Durum Sorgu Hatası:', error);
@@ -122,17 +136,40 @@ operatorRouter.post('/rampa-ata', async (req: Request, res: Response): Promise<v
       [randevuId, tip, rampaId]
     );
 
-    // 2. Randevu durumunu OPERASYONDA yap
+    // 2. Randevu durumunu OPERASYONDA yap ve çağrı bilgilerini mühürle
     await sorgu(
       `UPDATE randevular 
-       SET durum = 'OPERASYONDA' 
+       SET durum = 'OPERASYONDA',
+           atanan_rampa_id = $2,
+           atanan_rampa_adi = $3,
+           rampa_cagri_zamani = NOW(),
+           cagri_durumu = 'CAGRILDI'
        WHERE id = $1`,
-      [randevuId]
+      [randevuId, rampaId, rampa.ad]
+    );
+
+    // 3. Sürücüye Rampa Çağrı Bildirimi / Mesajı Gönder (Veritabanı Entegrasyonu)
+    const cagriMesaj = `Sayın ${randevu.sofor_ad_soyad || 'Sürücü'}, ${randevu.plaka} aracınız ${rampa.sehir} terminalinde ${rampa.ad} peronuna atanmıştır. Lütfen en geç 15 dakika içinde perona yanaşınız! (İşlem Türü: ${tip === 'YUKLEME' ? 'Yükleme' : 'Yük Boşaltma'})`;
+
+    await sorgu(
+      `INSERT INTO bildirimler (
+        randevu_id, tir_id, plaka, baslik, mesaj, tip, rampa_no, rampa_adi, operasyon_tipi
+      ) VALUES ($1, $2, $3, $4, $5, 'RAMPA_CAGRISI', $6, $7, $8)`,
+      [
+        randevuId,
+        randevu.tir_id,
+        randevu.plaka,
+        `🚨 RAMPA ÇAĞRISI: ${rampa.ad}`,
+        cagriMesaj,
+        rampa.numara ? rampa.numara.toString() : '1',
+        rampa.ad,
+        tip,
+      ]
     );
 
     res.json({
       basarili: true,
-      mesaj: `${randevu.plaka} aracı ${rampa.ad} istasyonuna başarıyla atandı (${tip === 'YUK_BOSALTMA' ? 'Yük Boşaltma' : 'Yükleme'}).`,
+      mesaj: `${randevu.plaka} aracı ${rampa.ad} istasyonuna başarıyla atandı (${tip === 'YUK_BOSALTMA' ? 'Yük Boşaltma' : 'Yükleme'}). Sürücüye rampa çağrı bildirimi iletildi.`,
     });
   } catch (error: any) {
     console.error('Rampa Atama Hatası:', error);
@@ -185,9 +222,25 @@ operatorRouter.post('/operasyon-tamamla', async (req: Request, res: Response): P
       await sorgu(
         `UPDATE randevular 
          SET durum = 'TAMAMLANDI', 
+             cagri_durumu = 'TAMAMLANDI',
              islem_bitis_zamani = NOW()
          WHERE id = $1`,
         [randevuId]
+      );
+
+      // Sürücüye tamamlanma bildirimi
+      await sorgu(
+        `INSERT INTO bildirimler (
+          randevu_id, tir_id, plaka, baslik, mesaj, tip, rampa_adi, operasyon_tipi
+        ) VALUES ($1, $2, $3, $4, $5, 'OPERASYON_TAMAMLANDI', $6, 'YUK_BOSALTMA')`,
+        [
+          randevuId,
+          randevu?.tir_id,
+          randevu?.plaka,
+          '✓ Yük Boşaltma Tamamlandı',
+          `Sayın ${randevu?.sofor_ad_soyad || 'Sürücü'}, ${randevu?.plaka} aracınızın ${rampa.ad} peronundaki boşaltma işlemi tamamlanmıştır. Terminalden çıkış yapabilirsiniz.`,
+          rampa.ad
+        ]
       );
 
       // Tırın mevcut konumunu (sehir) bu şehir olarak güncelle (artık bu şehirden yeni randevu alabilir)
@@ -207,18 +260,50 @@ operatorRouter.post('/operasyon-tamamla', async (req: Request, res: Response): P
       return;
     }
 
-    // Eğer işlem yükleme ise, araç sevk edilir ve YOLDA olur!
+    // Eğer işlem yükleme ise, operatör resmi dijital sevk irsaliyesini oluşturur ve sürücü onayına sunar!
+    const { yukCinsi, tonajKg, paletSayisi, muhurNo } = req.body;
+
+    const rastgeleEk = Math.floor(1000 + Math.random() * 9000);
+    const irsaliyeNo = `LOS-IRS-${new Date().getFullYear()}-${rastgeleEk}`;
+    const netYukCinsi = yukCinsi || 'Endüstriyel Yedek Parça & Muhtelif Emtia';
+    const netTonaj = tonajKg ? Number(tonajKg) : 21400;
+    const netPalet = paletSayisi ? Number(paletSayisi) : 32;
+    const netMuhur = muhurNo || `MHR-${Math.floor(10000 + Math.random() * 90000)}`;
+
     await sorgu(
       `UPDATE randevular 
-       SET durum = 'YOLDA', 
-           cikis_zamani = NOW()
-       WHERE id = $1`,
-      [randevuId]
+       SET irsaliye_no = $1, 
+           yuk_cinsi = $2, 
+           tonaj_kg = $3, 
+           palet_sayisi = $4, 
+           muhur_no = $5, 
+           irsaliye_tarihi = NOW(), 
+           irsaliye_durumu = 'DUZENLENDI', 
+           durum = 'YUKLENDI_IMZA_BEKLIYOR', 
+           cagri_durumu = 'IMZA_BEKLENIYOR'
+       WHERE id = $6`,
+      [irsaliyeNo, netYukCinsi, netTonaj, netPalet, netMuhur, randevuId]
+    );
+
+    // Sürücüye irsaliye imzalama çağrı bildirimi gönder
+    await sorgu(
+      `INSERT INTO bildirimler (
+        randevu_id, tir_id, plaka, baslik, mesaj, tip, rampa_adi, operasyon_tipi
+      ) VALUES ($1, $2, $3, $4, $5, 'IRSALIYE_HAZIR', $6, 'YUKLEME')`,
+      [
+        randevuId,
+        randevu?.tir_id,
+        randevu?.plaka,
+        `📋 Sevk İrsaliyeniz Hazır (${irsaliyeNo})`,
+        `Sayın ${randevu?.sofor_ad_soyad || 'Sürücü'}, ${randevu?.plaka} aracınızın ${rampa.ad} peronundaki yüklemesi tamamlanmıştır. Net: ${netTonaj} kg (${netYukCinsi}). Lütfen cep telefonunuzdan e-imzanız ile onaylayarak ${randevu?.varis_sehri} istikametine yola çıkınız.`,
+        rampa.ad
+      ]
     );
 
     res.json({
       basarili: true,
-      mesaj: `Yükleme tamamlandı! ${randevu?.plaka} aracı ${randevu?.varis_sehri} istikametine yola çıkarıldı.`,
+      mesaj: `Yükleme tamamlandı ve Resmi Sevk İrsaliyesi (${irsaliyeNo}) oluşturuldu. Sürücü e-imza onayına iletildi.`,
+      irsaliyeNo,
     });
   } catch (error: any) {
     console.error('Operasyon Tamamlama Hatası:', error);

@@ -4,7 +4,88 @@
 
 @layer base {
   body {
-    @apply antialiased text-slate-900 bg-white font-sans;
+    @apply antialiased text-slate-900 bg-[#f4f6fa] font-sans;
   }
 }
 
+/* ===== Animasyonlar ===== */
+@keyframes shake {
+  0%, 100% { transform: translateX(0); }
+  20%, 60% { transform: translateX(-4px); }
+  40%, 80% { transform: translateX(4px); }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+@keyframes float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-6px); }
+}
+
+.animate-shake {
+  animation: shake 0.35s ease-in-out;
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.4s ease-out both;
+}
+
+.animate-fade-in-delay-1 {
+  animation: fadeIn 0.4s ease-out 0.1s both;
+}
+
+.animate-fade-in-delay-2 {
+  animation: fadeIn 0.4s ease-out 0.2s both;
+}
+
+.animate-pulse-dot {
+  animation: pulse-dot 2s ease-in-out infinite;
+}
+
+.animate-float {
+  animation: float 3s ease-in-out infinite;
+}
+
+/* Saha Park Çizgileri Deseni (Rampa Yanaşma Alanı Kılavuz Deseni) */
+.dock-tarmac-pattern {
+  background-image: repeating-linear-gradient(
+    45deg,
+    rgba(226, 232, 240, 0.45),
+    rgba(226, 232, 240, 0.45) 8px,
+    transparent 8px,
+    transparent 16px
+  );
+}
+
+.dock-stripes-yellow {
+  background-image: repeating-linear-gradient(
+    -45deg,
+    rgba(245, 158, 11, 0.15),
+    rgba(245, 158, 11, 0.15) 10px,
+    transparent 10px,
+    transparent 20px
+  );
+}
+
+/* Input focus geçişleri */
+.input-field {
+  @apply w-full px-4 py-3 rounded-lg border border-slate-200 bg-white text-sm text-slate-900 
+         placeholder:text-slate-400 
+         focus:outline-none focus:border-slate-900 focus:ring-1 focus:ring-slate-900
+         transition-all duration-200;
+}
+
+.input-field-icon {
+  @apply w-full pl-11 pr-4 py-3 rounded-lg border border-slate-200 bg-white text-sm text-slate-900 
+         placeholder:text-slate-400 
+         focus:outline-none focus:border-slate-900 focus:ring-1 focus:ring-slate-900
+         transition-all duration-200;
+}
